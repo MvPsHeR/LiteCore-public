@@ -1,0 +1,545 @@
+<?php
+
+namespace essentialteam\essentialauth;
+
+use essentialteam\essentialauth\utils\Helper;
+use pocketmine\command\Command;
+use pocketmine\command\CommandSender;
+use pocketmine\level\Position;
+use pocketmine\entity\Effect;
+use pocketmine\entity\Projectile;
+use pocketmine\event\block\BlockBreakEvent;
+use pocketmine\event\block\ItemFrameDropItemEvent;
+use pocketmine\event\entity\EntityDamageByEntityEvent;
+use pocketmine\event\entity\EntityDamageEvent;
+use pocketmine\event\entity\EntityTeleportEvent;
+use pocketmine\event\entity\ProjectileLaunchEvent;
+use pocketmine\event\inventory\CraftItemEvent;
+use pocketmine\event\inventory\InventoryPickupArrowEvent;
+use pocketmine\event\inventory\InventoryPickupItemEvent;
+use pocketmine\event\inventory\InventoryTransactionEvent;
+use pocketmine\event\Listener;
+use pocketmine\event\player\PlayerCommandPreprocessEvent;
+use pocketmine\event\player\PlayerDropItemEvent;
+use pocketmine\event\player\PlayerInteractEvent;
+use pocketmine\event\player\PlayerItemConsumeEvent;
+use pocketmine\event\player\PlayerJoinEvent;
+use pocketmine\event\player\PlayerLoginEvent;
+use pocketmine\event\player\PlayerMoveEvent;
+use pocketmine\event\player\PlayerQuitEvent;
+use pocketmine\inventory\BaseTransaction;
+use pocketmine\inventory\PlayerInventory;
+use pocketmine\Player;
+use pocketmine\plugin\PluginBase;
+use pocketmine\Server;
+use pocketmine\utils\Config;
+use pocketmine\scheduler\CallbackTask;
+use SQLite3;
+use function array_shift;
+use function crypt;
+use function explode;
+use function in_array;
+use function md5;
+use function min;
+use function sha1;
+use function strtolower;
+use function substr;
+use function time;
+use const SQLITE3_ASSOC;
+use const SQLITE3_TEXT;
+
+class EssentialAuth extends PluginBase implements Listener{
+
+	const COMMANDS_EXCEPTION = [
+		"/ban", "/kick", "/ban-ip",
+		"/bantime", "/kill", "/mute",
+		"/warp", "/rg", "/ban", "/kit",
+	];
+
+	/** @var SQLite3 */
+	private $db;
+	private $users = [], $reg = [];
+
+	/** @var Config */
+	private $blockedPlayers;
+
+	public function onEnable() : void{
+		if(!is_dir($this->getDataFolder()))
+			@mkdir($this->getDataFolder());
+		$this->config = (new Config($this->getDataFolder() . "config.yml", Config::YAML, ["salt" => "ТвойКлючШифрования"]))->getAll();
+		/** @var SQLite3 db */
+		$this->db = new SQLite3($this->getDataFolder() . "users.db");
+		$this->db->exec(stream_get_contents($this->getResource("database.sql")));
+		$this->getServer()->getPluginManager()->registerEvents($this, $this);
+
+		$this->blockedPlayers = new Config($this->getDataFolder() . "blocked_players.json", Config::JSON);
+		$changed = false;
+		foreach($this->blockedPlayers->getAll() as $identifier => $blockedUntil){
+			if($blockedUntil <= time()){
+				$changed = true;
+				$this->blockedPlayers->remove($identifier);
+			}
+		}
+		if($changed)
+			$this->blockedPlayers->save();
+	}
+
+	private static $instance;
+
+	public function onLoad() : void{
+		self::$instance = $this;
+	}
+
+	public static function getInstance() : EssentialAuth{
+		return self::$instance;
+	}
+
+	public function hasLogined(Player $player) : bool{
+		return isset($this->users[strtolower($player->getName())]);
+	}
+
+	public function onDrop(PlayerDropItemEvent $e){
+		$player = $e->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§cНельзя выкидывать предметы, пока ты не авторизуешься!');
+			$e->setCancelled(true);
+		}
+	}
+
+	public function onBreak(BlockBreakEvent $e){
+		$player = $e->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§cНельзя взаимодействовать с сервером, пока ты не авторизуешься!');
+			$e->setCancelled(true);
+		}
+	}
+
+	/**
+	 * @param PlayerInteractEvent $e
+	 * @noinspection PhpUnused
+	 * @ignoreCancelled true
+	 * @priority LOWEST
+	 */
+	public function onTap(PlayerInteractEvent $e){
+		$player = $e->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$e->setCancelled(true);
+		}
+	}
+
+	public function onLogin(PlayerLoginEvent $event){
+		$player = $event->getPlayer();
+		$address = $player->getAddress();
+		$clientId = $player->getClientId();
+		if(!$this->blockedPlayers->exists($address) and !$this->blockedPlayers->exists($clientId)){
+			return;
+		}
+		$byAddress = (int)$this->blockedPlayers->get($address, -1);
+		$byClientId = (int)$this->blockedPlayers->get($clientId, -1);
+		$blockedUntil = max($byAddress, $byClientId);
+		if($blockedUntil > ($currentTime = time())){
+			$timeLeft = function() use ($blockedUntil, $currentTime) : string{
+				$time = $blockedUntil - $currentTime;
+
+				$minutes = (int)($time / 60);
+				$time = $time - $minutes * 60;
+				$seconds = (int)$time;
+
+				$result = "";
+				$array = ["м." => $minutes, "с." => $seconds];
+				foreach($array as $key => $value){
+					if($value > 0){
+						$result .= $value . " " . $key . " ";
+					}
+				}
+				return substr($result, 0, -1);
+			};
+			$event->setCancelled(true);
+			$player->kick("§7* §cВы временно заблокированы за ввод неверного пароля.\n§7* §cВы сможете зайти через §f" . $timeLeft() . ".", false);
+		}
+	}
+
+	public function onPlayerJoin(PlayerJoinEvent $event){
+		$player = $event->getPlayer();
+		$nick = $player->getName();
+		$sql = $this->db->prepare("SELECT * FROM `users` WHERE `nickname` = :nickname");
+		$sql->bindValue(":nickname", strtolower($player->getName()), SQLITE3_TEXT);
+		$sql = $sql->execute();
+		$user = $sql->fetchArray(SQLITE3_ASSOC);
+		if(isset($user["nickname"])){
+			$player->sendMessage("§8| §l§6Авторизация§r §8× §fПриветствуем на сервере!\n§8| §l§6Авторизация§r §8× §fДля входа введите пароль в §eчат, §fего никто §eне увидит!");
+			$player->setImmobile(true);
+		}else{
+			$player->sendMessage("§8| §l§6Авторизация§r §8× §fПриветствуем на нашем гриферском сервере!\n§8| §l§6Авторизация§r §8× §fВы зашли впервые, для регистрации введите пароль в §eчат, §fего никто §eне увидит!");
+			$this->getServer()->broadcastMessage("§8| §fНа сервере новый игрок §e{$nick}!\n§8| §fПоприветствуем новичка!");
+			$player->setImmobile(true);
+			$player->addEffect(Effect::getEffect(15)->setVisible(false)->setAmplifier(1)->setDuration(20 * 9999999));
+		}
+		$sql->finalize();
+	}
+
+	public function onPlayerQuit(PlayerQuitEvent $event){
+		if(($player = $event->getPlayer())->loggedIn and isset($this->users[$playerName = strtolower($player->getName())])){
+			unset($this->users[$playerName]);
+		}
+	}
+
+	private $attempts = [];
+
+	/**
+	 * @param PlayerCommandPreprocessEvent $event
+	 * @priority LOWEST
+	 */
+	public function onPlayerCommandPreprocess(PlayerCommandPreprocessEvent $event){
+		$login = "§8| §l§6Авторизация§r §8× §fВведите §eсвой пароль §fв чат, который вводили при регистрации.";
+		$player = $event->getPlayer();
+		$name = strtolower($player->getName());
+		$ip = $player->getAddress();
+		$msg = $event->getMessage();
+		if(!isset($this->users[$name])){
+			if(count(explode("/", $msg)) > 1){
+				$event->setCancelled(true);
+				$player->sendMessage($login);
+			}else{
+				$msg = explode(" ", $msg);
+				if(count($msg) == 1){
+					$sql = $this->db->prepare("SELECT * FROM `users` WHERE `nickname` = :nickname");
+					$sql->bindValue(":nickname", $name, SQLITE3_TEXT);
+					$sql = $sql->execute();
+					if($sql instanceof \SQLite3Result){
+						$pass = crypt(md5($rawPass = $msg[0]), sha1($this->config["salt"]));
+						$user = $sql->fetchArray(SQLITE3_ASSOC);
+						if(!empty($user["nickname"])){
+							if($pass == $user["password"]){
+								$upd = $this->db->prepare("UPDATE `users` SET `ipLast` = :ip WHERE `nickname` = :nickname");
+								$upd->bindValue(":ip", $ip);
+								$upd->bindValue(":nickname", $name);
+								$upd = $upd->execute();
+								$upd->finalize();
+								$this->users[$name] = ["pass" => $pass, "ip" => $ip];
+								$player->removeAllEffects();
+								$player->sendMessage("§8| §l§6Авторизация§r §8× §fВы вошли в аккаунт. Приятной игры!\n§8| §l§6Авторизация§r §8× §fПомощь по серверу: §e/help\n");
+								$player->sendTitle("§l§6Ｔｈｕｎｄｅｒ§fＷｉｘ", "§r§fПриятной игры!");
+								Helper::sendSound($player, 'ambient.weather.thunder', true, 0.9);
+								Helper::sendSound($player, 'random.explode', true, 0.9);
+								$player->getLevel()->spawnLightning(new Position($player->getX(), $player->getY(), $player->getZ()));
+                                $player->getLevel()->spawnLightning(new Position($player->getX(), $player->getY(), $player->getZ()));
+                                $player->addActionBarMessage("§fЖелаем вам приятной игры\n§fна нашем сервере!");
+								unset($this->attempts[$name]);
+								$player->setImmobile(false);
+								if (strlen($rawPass) <= 5) {
+									$player->sendMessage("§8| §l§6Авторизация§r §8× §cВаш пароль слишком короткий! Советуем вам его изменить на более длинный!\n");
+								}
+							}else{
+								if(!isset($this->attempts[$name]))
+									$this->attempts[$name] = 0;
+								if(++$this->attempts[$name] < 3){
+									$number = 3 - $this->attempts[$name];
+									$player->sendMessage("§8| §l§6Авторизация§r §8× §fВы ввели §cневерный пароль. §fУ вас " . ($number !== 1 ? "осталось" : "осталась") . " §e" . $number . " " . $this->convert($number, "попытка,попытки, попыток") . "!");
+								}else{
+									$this->blockPlayer($player);
+								}
+							}
+						}else{
+							if(!isset($this->reg[$name])){
+								if (strlen($rawPass) <= 5) {
+									$event->setCancelled(true);
+									$player->sendMessage("§8| §l§6Авторизация§r §8× §fВаш пароль слишком §cкороткий! §fМинимум 6 символов!");
+								}else{
+									$this->reg[$name] = $pass;
+								    $player->sendMessage("§8| §l§6Авторизация§r §8× §fДля подтверждения, введите §eсвой пароль §fв чат повторно!");
+								}
+							}else{
+								if($pass == $this->reg[$name]){
+									$add = $this->db->prepare("INSERT INTO `users`(`nickname`, `password`, `ipReg`, `ipLast`) VALUES(:nickname, :password, :ip, :ip)");
+									$add->bindValue(":nickname", $name);
+									$add->bindValue(":password", $pass);
+									$add->bindValue(":ip", $ip);
+									$add = $add->execute();
+									$add->finalize();
+									$this->users[$name] = ["pass" => $pass, "ip" => $ip];
+									$player->removeAllEffects();
+									$player->setImmobile(false);
+									$player->sendMessage("§8| §l§6Авторизация§r §8× §fВы зарегистрировались на сервере. Приятной игры!\n§8| §l§6Авторизация§r §8× §fПомощь по серверу: §e/help\n");
+								$player->sendTitle("§l§6Ｔｈｕｎｄｅｒ§fＷｉｘ", "§r§fПриятной игры!");
+								Helper::sendSound($player, 'ambient.weather.thunder', true, 0.9);
+								Helper::sendSound($player, 'random.explode', true, 0.9);
+								$player->getLevel()->spawnLightning(new Position($player->getX(), $player->getY(), $player->getZ()));
+                                $player->getLevel()->spawnLightning(new Position($player->getX(), $player->getY(), $player->getZ()));
+                                $player->addActionBarMessage("§fЖелаем вам приятной игры\n§fна нашем сервере!");
+								}else{
+									unset($this->reg[$name]);
+									$player->sendMessage("§8| §l§6Авторизация§r §8× §cНеверный пароль!");
+								}
+							}
+						}
+					}
+					$sql->finalize();
+				}else $player->sendMessage($login);
+			}
+			$event->setCancelled(true);
+		}else{
+			if($ip != $this->users[$name]["ip"]){
+				$event->setCancelled(true);
+				$player->sendMessage($login);
+			}
+
+		}
+	}
+
+	private function convert($n, $a){
+		$a = explode(",", $a);
+		$cases = [2, 0, 1, 1, 1, 2];
+		return $a[($n % 100 > 4 and $n % 100 < 20) ? 2 : $cases[min($n % 10, 5)]];
+	}
+
+	const BLOCK_MINUTES = 15;
+
+	private function blockPlayer(Player $player){
+		unset($this->attempts[strtolower($player->getName())]);
+		$player->kick("§5* §cВы ввели неверный пароль более §e2-х раз.\n§5* §cПопробуйте снова через §e15 минут.", false);
+		$this->blockedPlayers->set($player->getAddress(), time() + 60 * EssentialAuth::BLOCK_MINUTES);
+		$this->blockedPlayers->set($player->getClientId(), time() + 60 * EssentialAuth::BLOCK_MINUTES);
+		$this->blockedPlayers->save();
+	}
+
+	const MIN_LENGTH = 6;
+
+	public function onCommand(CommandSender $player, Command $command, $commandLabel, array $args){
+		if($command->getName() == 'changepassword'){
+			if(!$player instanceof Player){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cКоманду /" . $commandLabel . " можно использовать только в игре!");
+				return true;
+			}
+			if(!isset($args[1])){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cФормат использования: §e/" . $commandLabel . " (текущий пароль) (новый пароль)");
+				return true;
+			}
+			$sql = $this->db->prepare("SELECT * FROM `users` WHERE `nickname` = :nickname");
+			$sql->bindValue(":nickname", strtolower($player->getName()), SQLITE3_TEXT);
+			$sql = $sql->execute();
+			$user = $sql->fetchArray(SQLITE3_ASSOC);
+			$sql->finalize();
+			if(!isset($user["password"])){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cПроизошла ошибка. Невозможно сменить пароль!");
+				return true;
+			}
+			$dbPassword = $user["password"];
+			$currentPassword = crypt(md5(array_shift($args)), sha1($this->config["salt"]));
+			if($dbPassword != $currentPassword){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cПароль от этого аккаунта не совпадает с введённым!");
+				return true;
+			}
+			$newPassword = crypt(md5($rawPassword = array_shift($args)), sha1($this->config["salt"]));
+			if(!isset($rawPassword[EssentialAuth::MIN_LENGTH - 1])){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cНовый пароль слишком короткий!");
+				return true;
+			}
+			if(strtolower($rawPassword) === strtolower($player->getName())){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cНовый пароль не должен совпадать с вашим никнеймом!");
+				return true;
+			}
+			$this->changePassword($player, $newPassword);
+			$player->sendMessage("§8| §l§6Авторизация§r §8× §fВы успешно поменяли свой пароль на §e" . $rawPassword);
+		}elseif($command->getName() == 'unregister'){
+			if($player instanceof Player){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cНедостаточно прав для использования команды §e/" . $commandLabel . "!");
+				return true;
+			}
+			if(!isset($args[0])){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cФормат использования: §e/" . $commandLabel . " (имя игрока полностью)");
+				return true;
+			}
+			$playerName = strtolower(array_shift($args));
+			$sql = $this->db->prepare("SELECT * FROM `users` WHERE `nickname` = :nickname");
+			$sql->bindValue(":nickname", $playerName, SQLITE3_TEXT);
+			$sql = $sql->execute();
+			$user = $sql->fetchArray(SQLITE3_ASSOC);
+			$sql->finalize();
+			if(!isset($user["nickname"])){
+				$player->sendMessage("§8| §l§6Авторизация§r §8× §cИгрок §e". $playerName ." §cне зарегистрирован на сервере!");
+				return true;
+			}
+			$sql = $this->db->prepare("DELETE FROM `users` WHERE `nickname` = :nickname");
+			$sql->bindValue(":nickname", $playerName, SQLITE3_TEXT);
+			$sql = $sql->execute();
+			$sql->finalize();
+			$player->sendMessage("§8| §l§6Авторизация§r §8× §fПароль игрока §e". $playerName ." §fбыл успешно сброшен!");
+
+			$playerInstance = Server::getInstance()->getPlayerExact($playerName);
+			if($playerInstance instanceof Player and $playerInstance->isOnline()){
+				$playerInstance->kick('§cВаш пароль был сброшен администрацией!', false);
+			}
+			return true;
+		}
+		return true;
+	}
+
+	public function changePassword(Player $player, string $newPassword){
+		$upd = $this->db->prepare("UPDATE `users` SET `password` = :password WHERE `nickname` = :nickname");
+		$upd->bindValue(":nickname", $playerName = strtolower($player->getName()));
+		$upd->bindValue(":password", $newPassword);
+		$upd = $upd->execute();
+		$this->users[$playerName]["pass"] = $newPassword;
+		$upd->finalize();
+	}
+
+	/**
+	 * @param EntityDamageEvent $event
+	 * @priority LOWEST
+	 * @ignoreCancelled true
+	 */
+	public function onDamage(EntityDamageEvent $event){
+		$player = $event->getEntity();
+		    if($player instanceof Player){
+			    if($event instanceof EntityDamageByEntityEvent){
+				$damager = $event->getDamager();
+				    if($damager instanceof Player){
+					    if(!isset($this->users[$damager->getLowerCaseName()])){
+						    $damager->sendMessage('§8| §l§6Авторизация§r §8× §cАвторизуйся чтобы атаковать других сущностей!');
+						    $event->setCancelled(true);
+						return;
+				    }
+			    }
+		    }
+
+			if(!isset($this->users[$player->getLowerCaseName()])){
+				$event->setCancelled(true);
+			}
+		}
+	}
+
+	/**
+	 * @param ItemFrameDropItemEvent $event
+	 * @priority LOWEST
+	 * @ignoreCancelled true
+	 */
+	public function onFrame(ItemFrameDropItemEvent $event){
+		$player = $event->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§8| §l§6Авторизация§r §8× §cНельзя взаимодействовать с рамками, пока ты не авторизуешься!');
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onTeleport(EntityTeleportEvent $event){
+		if($event->isCancelled()){
+			return;
+		}
+		$player = $event->getEntity();
+		if(!$player instanceof Player){
+			return;
+		}
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onPickupItem(InventoryPickupItemEvent $event){
+		$inventory = $event->getInventory();
+		if(!$inventory instanceof PlayerInventory){
+			return;
+		}
+		$player = $inventory->getHolder();
+		if(!$player instanceof Player){
+			return;
+		}
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onPickupArrow(InventoryPickupArrowEvent $event){
+		$inventory = $event->getInventory();
+		if(!$inventory instanceof PlayerInventory){
+			return;
+		}
+		$player = $inventory->getHolder();
+		if(!$player instanceof Player){
+			return;
+		}
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onCraftItem(CraftItemEvent $event){
+		$player = $event->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§8| §l§6Авторизация§r §8× §cНельзя крафтить, пока ты не авторизуешься!');
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onItemConsume(PlayerItemConsumeEvent $event){
+		$player = $event->getPlayer();
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§8| §l§6Авторизация§r §8× §cНельзя кушать, пока ты не авторизуешься!');
+			$event->setCancelled(true);
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onTransaction(InventoryTransactionEvent $event){
+		$queue = $event->getQueue();
+		/** @var BaseTransaction $transaction */
+		foreach($queue->getTransactions() as $transaction){
+			$inventory = $transaction->getInventory();
+			if($inventory instanceof PlayerInventory){
+				$player = $inventory->getHolder();
+				if($player instanceof Player){
+					if(!isset($this->users[$player->getLowerCaseName()])){
+						$event->setCancelled(true);
+						$player->sendPopup('§5► §cАвторизуйся для взаимодействия с сервером!');
+					}
+				}
+			}
+		}
+	}
+
+	/** @noinspection PhpUnused */
+	public function onProjectileLaunch(ProjectileLaunchEvent $event){
+		$entity = $event->getEntity();
+		if(!$entity instanceof Projectile){
+			return;
+		}
+		$player = $entity->getOwningEntity();
+		if(!$player instanceof Player){
+			return;
+		}
+		if(!isset($this->users[$player->getLowerCaseName()])){
+			$player->sendMessage('§8| §l§6Авторизация§r §8× §cНельзя взаимодействовать с сервером, пока ты не авторизуешься!');
+			$event->setCancelled(true);
+		}
+	}
+
+	public function onPreprocess(PlayerCommandPreprocessEvent $event){
+		$player = $event->getPlayer();
+		$message = $event->getMessage();
+		if(substr($message, 0, 1) === "/"){
+			$args = explode(" ", $message);
+			if(!isset($args[0])){
+				return;
+			}
+			$command = array_shift($args);
+			if(in_array($command, EssentialAuth::COMMANDS_EXCEPTION, true)){
+				return;
+			}
+			foreach($args as $arg){
+				$target = Server::getInstance()->getPlayer($arg);
+				if($target instanceof Player and $target->isOnline() and !isset($this->users[$target->getLowerCaseName()])){
+					$player->sendMessage("§8| §l§6Авторизация§r §8× §cНевозможно выполнить эту команду! §e" . $target->getName() . " §cне авторизован!");
+					$event->setCancelled(true);
+					return;
+				}
+			}
+		}
+	}
+
+
+}
